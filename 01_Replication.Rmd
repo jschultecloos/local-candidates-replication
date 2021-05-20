@@ -1,0 +1,1897 @@
+---
+title: |
+  Replication material: Schulte-Cloos & Bauer (2021) 'Local candidates, place-based identities, and electoral success' in: Political Behavior, doi: 10.1007/s11109-021-09712-y.
+author: |
+  Julia Schulte-Cloos & Paul C. Bauer
+date: |
+  `r lubridate::today()`
+output:
+  bookdown::html_document2:
+    theme: cosmo
+    highlight: textmate
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+    number_sections: yes
+    code_folding: hide
+    toc_depth: 2 
+link-citations: true
+bibliography: [references_replication.bib]
+---
+
+
+This R Markdown (Rmd) file contains replication material to reproduce the results reported in doi: 10.1007/s11109-021-09712-y. 
+
+*Note*: We rely on the [R package management tool `pacman`](https://cran.r-project.org/web/packages/pacman/index.html). Please run `install.packages("pacman")` to install the package from CRAN. The command `pacman::p_load()` will then import all specified packages and install them beforehand in case they are currently not installed on your machine.
+
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  cache = FALSE, 
+  fig.showtext = TRUE
+)
+
+
+# Load packages 
+pacman::p_load(
+  tidyverse,
+  kableExtra,
+  sf,
+  RColorBrewer,
+  tictoc,
+  spdep,
+  gridExtra,
+  rgenoud,
+  colorspace,
+  showtext, 
+  imagemagick,
+  sandwich,
+  broom,
+  magick,
+  osmdata,
+  modelsummary,
+  ggpattern, 
+  patchwork,
+  cowplot,
+  ggpubr
+)
+
+
+
+# runif(1,0, 10^8) # 40569693
+set.seed(40569693)
+
+# Avoid intext scientific notation
+options(scipen = 999)
+
+
+font_add_google(
+  name = "Fira Sans",
+  family = "Fira Sans"
+)
+
+## ggplot themeset
+ggplot2::theme_set(theme(text = element_text(
+  size = 10, 
+  family = "Fira Sans"
+)))
+showtext_auto()
+```
+
+
+# Dataset and geo-matching 
+
+We load our dataset which contains information on the electoral performance of single-member district candidates during the German national elections in 2013 and 2017. 
+
+```{r import-raw-data}
+
+data_raw <- read_csv("data/data_raw.csv")
+data_raw <- data_raw %>% mutate(id = row_number()) # Add unique ID
+
+glimpse(data_raw %>% arrange(desc(electoral_district), ags))
+```
+
+Next, we specify our geo-matching function. We use a genetic optimal matching (GenMatch) algorithm [@Diamond2013-uo], relying on 1:2 matching with replacement. GenMatch uses an evolutionary search algorithm developed by Mebane and Sekhon [@Sekhon1998-pw] and automates this process to iteratively check, improve, and maximize the balance of observed covariates across matched treated and control units [@Diamond2013-uo, 932f]. The replacement avoids any bias that may result from finding matches in the same order that the data are sorted (for a detailed discussion of the matching algorithm, see the documentation of the R software package `Matching` [@Sekhon.2008]).
+
+
+
+
+```{r define-genetic-matching-function, eval=FALSE}
+
+gen_match <- function(name_output,
+                      data,
+                      treatment_var,
+                      outcome_var,
+                      control_vars_exact,
+                      control_vars_matching,
+                      id_vars, 
+                      popsize = 100,
+                      max.generations = 10,
+                      M = 2,
+                      replace = TRUE) {
+
+  # Set the treated municipalities to vec_neighbors = 1 to define the geo-matching pool
+  data$vec_neighbors[data$d_residence == 1] <- 1
+
+
+  # Subset and recode data
+  data_for_matching <- data %>%
+    ungroup() %>%
+    dplyr::select(
+      all_of(treatment_var), outcome_var,
+      all_of(control_vars_exact),
+      all_of(control_vars_matching),
+      all_of(id_vars)
+    ) 
+
+
+  # Generate Covariate matrix and vectors
+  X <- data_for_matching %>%
+    dplyr::select(
+      all_of(control_vars_exact),
+      all_of(control_vars_matching)
+    ) %>%
+    data.frame() # Define covariates
+
+  Y <- data_for_matching %>%
+    dplyr::select(outcome_var) %>%
+    pull() # Define outcome vector
+
+  Tr <- data_for_matching %>%
+    dplyr::select(treatment_var) %>%
+    pull() # Define treatment vector
+
+  BalanceMat <- data.frame(X)
+
+  gen1 <- Matching::GenMatch(
+    Tr = Tr,
+    X = X,
+    BalanceMatrix = BalanceMat,
+    estimand = "ATT",
+    # number of matches to be found
+    M = M,
+    exact = c(
+      rep(1, length(control_vars_exact)),
+      rep(0, length(control_vars_matching))
+    ),
+    replace = replace,
+    pop.size = popsize,
+    max.generations = max.generations,
+    wait.generations = 4,
+    verbose = FALSE
+  )
+
+  mgens <- Matching::Match(
+    Y = Y,
+    Tr = Tr,
+    X = X,
+    estimand = "ATT",
+    M = M,
+    exact = c(
+      rep(1, length(control_vars_exact)),
+      rep(0, length(control_vars_matching))
+    ),
+    replace = replace,
+    Weight.matrix = gen1,
+    version = "fast"
+  )
+
+  # Store mgens
+  assign(paste0(name_output, "_mgens"),
+    mgens,
+    envir = .GlobalEnv
+  )
+
+  # Generate data_matched
+  data_matched <- rbind(
+    data_for_matching[mgens$index.treated, ],
+    data_for_matching[mgens$index.control, ]
+  )
+
+  # Add weight vector to data_matched
+  data_matched <- cbind(data_matched,
+    weights = rep(mgens$weights, 2)
+  )
+
+  # Store data_matched
+  data_matched <- data_matched %>% dplyr::select(
+    ags,
+    party, 
+    treatment_var,
+    everything()
+  )
+
+  assign(paste0(name_output),
+    data_matched,
+    envir = .GlobalEnv
+  )
+
+
+  # Message
+  cat("\n\n\nPerformed 1:", M, "(= M) matching\nreplacement = ", replace,
+    "\npopsize=", popsize,
+    "\nmax.generations =", max.generations,
+    "\n\nOriginal dataset (data_for_matching):\nN = ", nrow(data_for_matching),
+    "\n\nMatched dataset (data_matched):\nN (rows): ", nrow(data_matched),
+    "\nN rows (treated): ", nrow(data_matched %>% filter(d_residence == 1)),
+    "\nN rows (control): ", nrow(data_matched %>% filter(d_residence == 0)),
+    "\n\nUnique id (ALL): ",
+    length(unique(data_matched %>% pull(id))),
+    "\nUnique id (TREATED): ", length(unique(data_matched %>% filter(d_residence == 1) %>% pull(id))),
+    "\nUnique id (TREATED) * M: ", length(unique(data_matched %>% filter(d_residence == 1) %>% pull(id))) * M,
+    "\nUnique id (CONTROL): ",
+    length(unique(data_matched %>% filter(d_residence == 0) %>% pull(id))),
+    "\n",
+    sep = ""
+  )
+}
+```
+
+
+
+The geo-matching is computationally intense and may take a few hours to run depending on your machine. Therefore, we also save the resulting dataset (`data_processed.csv`) to be able to directly proceed with the analyses. The relevant variables from the geo-matching process are `geomatch` and the corresponding weights `geomatch_weights`. 
+
+
+
+```{r perform-genetic-matching, include = FALSE, eval=FALSE}
+
+tic()
+# runif(1,0, 10^8) # 40569693
+set.seed(40569693)
+
+## All municipalities ####
+gen_match(
+  name_output = "data_matched",
+  data = data_raw %>%
+    mutate(party = as.numeric(
+    forcats::fct_relevel(party,
+      levels = c(
+        "afd",
+        "cdu_csu",
+        "dielinke",
+        "fdp",
+        "greens",
+        "spd"
+      ))
+    )),
+  treatment_var = "d_residence",
+  outcome_var = "vote_share",
+  control_vars_exact = c(
+    "vec_neighbors", "year",
+    "electoral_district", "party"
+  ),
+  control_vars_matching = c(
+    "electoral_base", "area_km",
+    "inhabitants", "urbanisation", "vec_distances"
+  ), 
+  id_vars = c("id", "ags")
+  )
+
+
+# add the geomatch indicator to the raw data
+data_raw_matched <- full_join(data_raw %>%
+  mutate(partynum = as.numeric(
+    forcats::fct_relevel(party,
+      levels = c(
+        "afd",
+        "cdu_csu",
+        "dielinke",
+        "fdp",
+        "greens",
+        "spd"
+      )
+    )
+  )),
+data_matched %>% 
+  mutate(geomatch = 1) %>% 
+  select(year, electoral_district, d_residence, ags, party, id, geomatch),
+by = c(
+  "year" = "year",
+  "electoral_district" = "electoral_district",
+  "d_residence" = "d_residence",
+  "ags" = "ags",
+  "partynum" = "party", 
+  "id" = "id"
+)
+)
+
+
+## geomatch-weights: among each "electoral_district-party-triple", we need to weight the two control municipalities of a candidate's home municipality with 0.5 (so that they sum up to one) and weight the home municipality of a candidate with 1. 
+data_raw_matched = data_raw_matched %>% 
+  mutate(geomatch_weights = 
+           case_when(geomatch == 1 & d_residence == 0 ~ 0.5, 
+                     geomatch == 1 & d_residence == 1 ~ 1, 
+                     TRUE ~ NA_real_))
+
+
+## write processed data 
+write_csv(data_raw_matched %>% 
+            # drop the id variable, our identifier is the ags x party
+            select(-id),
+  path = "data/data_processed.csv"
+)
+
+
+toc()
+
+```
+
+
+```{r read-processed-data}
+
+data = read_csv("data/data_processed.csv")
+
+data2013 <- data %>%
+  filter(year == 2013)
+data2017 <- data %>%
+  filter(year == 2017)
+
+
+```
+
+The geo-matching strategy is visualized in Figure \@ref(fig:fig-1) and Figure \@ref(fig:fig-2) (Figure 1 and 2 in the manuscript) and its objectives are described in detail in the manuscript.
+
+
+```{r fig-1, echo=FALSE, fig.cap="Illustration of the identification strategy: candidates' residences within certain municipalities in each of the 299 electoral districts. The illustration shows electoral district 213 Ebersberg - Erding.", message=FALSE, warning=FALSE, fig.width = 8, fig.pos="tb"}
+
+# Map: Create subset for map 
+illustrated_wahlkreis <- 213
+
+
+# Load 2017 shape files
+map_data <- sf::read_sf("data/EW20171231utm32sshapeebenen/vg250-ew_ebenen/VG250_GEM.shp")
+
+map_data <- left_join(map_data %>% 
+                        rename(ags = AGS),
+  data2017,
+  by = c("ags" = "ags")
+)
+
+
+# MAP 1: Bavaria within Germany
+map_data_states <- sf::read_sf("data/EW20171231utm32sshapeebenen/vg250-ew_ebenen/VG250_LAN.shp")
+
+# SN_L = STATE IDENTIFIER
+p1 <- ggplot() +
+  geom_sf(
+    data = map_data_states,
+    fill = "white",
+    color = "black",
+    size = 0.1
+  ) +
+  geom_sf(
+    data = map_data_states %>%
+      filter(SN_L == "09"),
+    fill = "black",
+    color = "black"
+  ) +
+  theme_void() +
+  ggtitle("a) Bavaria:\nLocation within Germany") +
+  theme(plot.title = element_text(color = "black", size = 10)) +
+  theme(text = element_text(family = "Fira Sans"))
+
+
+# MAP 2: Elector districts within Bavaria
+map_data_bavaria <- map_data %>%
+  filter(SN_L == "09") %>%
+  dplyr::select("electoral_district")
+map_data_bav_elec_dist <- aggregate(
+  map_data_bavaria,
+  by = list(map_data_bavaria$electoral_district),
+  mean
+) %>%
+  select(electoral_district)
+
+map_data_bav_elec_dist_213 <- map_data_bav_elec_dist %>%
+  filter(electoral_district == illustrated_wahlkreis)
+
+p2 <- ggplot() +
+  geom_sf(
+    data = map_data_bav_elec_dist,
+    fill = "white",
+    color = "black",
+    size = 0.1
+  ) +
+  geom_sf(
+    data = map_data_bav_elec_dist_213,
+    fill = "black",
+    color = "black"
+  ) +
+  theme_void() +
+  ggtitle("b) Electoral district 213:\nLocation within Bavaria") +
+  theme(plot.title = element_text(color = "black", size = 10)) +
+  theme(text = element_text(family = "Fira Sans"))
+
+
+
+# MAP 3:
+map_data_mun_dist_213 <- map_data %>%
+  filter(electoral_district == illustrated_wahlkreis)
+
+
+## Add the polygons for the "Ebersberger Forest", which we get from Open Street Maps 
+ebersbergerforst_osm <- opq("ebersberger forst") %>%
+  add_osm_feature(key = "landuse", 
+                  value = "forest") %>%
+  osmdata_sf()
+sf::st_crs(ebersbergerforst_osm$osm_polygons) <- 4326
+
+
+p3 <- ggplot() +
+  geom_sf_pattern(
+    pattern_type = "stripe",
+    pattern_spacing = 0.02,
+    pattern_alpha = 1,
+    pattern_size = 0.1,
+    data = ebersbergerforst_osm$osm_polygons,
+  ) +
+  scale_pattern_type_discrete(choices = ggpattern::magick_pattern_names) +
+  geom_sf(
+    data = map_data_mun_dist_213 %>%
+      filter(d_residence == 0),
+    fill = "lightgray",
+    alpha = 0.7,
+    colour = "black", size = 0.1
+  ) +
+  geom_sf(
+    data = map_data_mun_dist_213 %>%
+      filter(d_residence == 1),
+    fill = sequential_hcl(3, palette = "BluYl")[1],
+    colour = "black", size = 0.1
+  ) +
+  theme_void() +
+  ggtitle("c) Electoral district 213: Municipalities with (blue) and without (gray)\nlocal candidates (Ebersberger forest shown in stripes)") +
+  theme(
+    legend.position = "none",
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),
+    plot.margin = unit(c(0, 0, 0, 0), "cm"),
+    plot.title = element_text(color = "black", size = 10)
+  ) +
+  theme(text = element_text(family = "Fira Sans"))
+
+
+(p1/p2) - p3 + 
+  plot_layout(widths = c(1.5, 2))
+
+
+
+```
+
+
+```{r generate-graphs-fig-2}
+
+
+data_plot <- left_join(
+  data2017 %>%
+    mutate(party = case_when(
+      party == "afd" ~ "AfD",
+      party == "cdu_csu" ~ "CDU/CSU",
+      party == "dielinke" ~ "Die Linke",
+      party == "fdp" ~ "FDP",
+      party == "greens" ~ "Greens",
+      party == "spd" ~ "SPD"
+    )) %>%
+    filter(electoral_district == 213),
+  # read shape file
+  sf::read_sf("data/EW20171231utm32sshapeebenen/vg250-ew_ebenen/VG250_GEM.shp") %>%
+    rename(ags = AGS) %>%
+    group_by(ags) %>%
+    # select the polygon with the larger number of inhabitants (the others are non-inhabitated regions)
+    arrange(desc(EWZ)) %>%
+    slice(1) %>%
+    # keep only ags and geometry
+    select(ags, geometry),
+  by = c("ags" = "ags")
+) %>%
+  # set the geometry column as simple features
+  sf::st_set_geometry(c("geometry")) %>%
+  group_by(party) %>%
+  nest() %>%
+  mutate(
+    neighbor_plot =
+      map(
+        .x = data,
+        .y = party,
+        ~ ggplot() +
+          # visualize map
+          geom_sf(
+            data = .x,
+            fill = "white",
+            color = "black",
+            size = 0.1
+          ) +
+          geom_sf_pattern(
+            pattern_type = "stripe",
+            pattern_spacing = 0.02,
+            pattern_alpha = 0.2,
+            pattern_size = 0.1,
+            size = 0.1, 
+            data = ebersbergerforst_osm$osm_polygons,
+          ) +
+          scale_pattern_type_discrete(choices = ggpattern::magick_pattern_names) + 
+          # visualize neighboring observations and treated municipalities
+          geom_sf(
+            data = .x %>%
+              filter(vec_neighbors == 1 | d_residence == 1),
+            aes(
+              fill = as.factor(d_residence)
+              ), 
+            color = "black",
+            lwd = 0.2
+          ) +
+          colorspace::scale_fill_discrete_sequential(
+            palette = "BluGrn", 
+            name = "Local Candidate") +
+          geom_point(
+            data = .x,
+            aes(x = lon, y = lat),
+            col = "black",
+            size = 0.1
+          ) +
+          theme_void() +
+          theme(text = element_text(family = "Fira Sans")) +
+          theme(plot.title = element_text(size = 10)) +
+          ggtitle(paste0(
+            "Party/Candidate: ",
+            .y
+          ))
+      )
+  )
+
+
+```
+
+
+```{r fig-2, echo=FALSE, fig.cap="Illustration of the geographic matching strategy: home municipality of each party's candidate and all adjacent municipalities that serve as potential control cases. The illustration shows electoral district *213 Ebersberg - Erding* (Ebersberger forest shaded in gray stripes).", message=FALSE, warning=FALSE, fig.pos="tb", fig.width=8}
+
+
+figure_2 <- ggarrange(data_plot$neighbor_plot[[1]],
+  data_plot$neighbor_plot[[2]],
+  data_plot$neighbor_plot[[3]],
+  data_plot$neighbor_plot[[4]],
+  data_plot$neighbor_plot[[5]],
+  data_plot$neighbor_plot[[6]],
+  common.legend = TRUE,
+  legend = "bottom",
+  ncol = 3,
+  nrow = 2
+)
+
+
+figure_2
+```
+
+
+
+## Description of the variables
+
+
+### Electoral data
+
+> `vote_share`, `party`, `ags`, `municipality`, `electoral_district`, `state`, `eligible` 
+
+The electoral data is provided by the Federal Returning Officer and is publicly available for each federal election. The data is released on the level of electoral wards (i.e., polling stations), which include both physical voting stations and mail voting stations. Since we want to understand the electoral implications of a candidate's localness on her electoral performance, we aggregated the polling level data to the unit of municipalities (unique municipality identifier: `ags`). The German municipalities correspond to the "LAU" level of the European regional classification. We consider both votes cast in a physical voting station and by mail. It is increasingly common to vote by mail among German citizens.[^12] As some municipalities share a mail voting district, we apportion the respective mail votes to the individual municipalities according to the number of citizens who applied for mail voting. 
+
+[^12]: In the federal election 2013, the share of votes cast by mail among all votes was 24.3 percentage, whereas in 2017, this share was even 28.6 percentage.
+
+### Candidate data
+
+> `d_residence`, `id_candidate`, `onballot_pr`
+
+The data on all candidates that ran for office in the 2013 and 2017 federal election is provided by the Federal Returning Officer upon request. This data contains personal information on all candidates including information on their place of residence. Therefore, after linking the data to the electoral data, we anonymized the entire dataset using a numeric candidate identifier. We linked the candidate data to the electoral data by matching all single-member district candidates to the municipalities that are part of the respective electoral district in which they run for office. The candidate data only provides natural language information on the place of residence of each candidate. Thus, we processed this information by means of natural language processing (NLP) and then linked the resulting character string to the corresponding municipality within the same electoral district.
+
+### Non-competitive candidates  
+
+> `uncompetitive`, `uncompetitive_absolute`
+
+As described in the study, the German electoral system combines a single-member district plurality tier with a PR tier that ultimately determines the allocation of seats in the German *Bundestag*. There is a clear majoritarian character to this first tier of the German electoral system as a single candidate gains office. Some of the six German parties, thus, do not have any prospects to achieve a simple majority in the electoral districts. As a matter of fact, most electoral districts have been won by one of the two mainstream parties, i.e., the Conservative (CDU/CSU) and the Social Democrats (SPD) [@Rossteuscher.2017]. Notwithstanding their marginal chances to gain office within some of the electoral districts, all parties tend to field candidates in the first electoral tier. As described in the study, we exploit this setting to isolate the effect of place-based identities on the local advantage of candidates.
+
+We obtained the data on the competitiveness of candidates by relying on the history of electoral performance of their party in the plurality tier over the respective two previous elections. The electoral data is obtained from the Federal Returning Officer and we aggregated the vote returns on the polling station level to the municipality-level following the same procedure as described above. We rely on two measures of non-competitiveness.
+
+First, we measure candidate's competitiveness in relation to the electoral district-specific level of party competition. In doing so, we take into account the differences in competitiveness that exist between electoral districts. While in some electoral districts, a given party may enjoy a clear electoral advantage over the other five parties, party competition may be more fierce in other electoral districts, and several parties may have prospects to win a simple majority. Consider, for instance, party competition within the electoral district *32 Cloppenburg -- Vechta*, located in Lower Saxony, during the federal election 2013. In this electoral district, the Conservatives (CDU) achieved almost two thirds of the vote share in the plurality tier (66.3%). Even while the Social Democrats (SPD) came in second with 21.28 percentage of the vote share, the difference to the largest party, the CDU, was still so large that the SPD was not competitive in this district. In the electoral district *14 Rostock -- Landkreis Rostock II*, in turn, the SPD also achieved around 20 percentage of the vote (18.31%), while the Conservatives came in first with 35.01 percentage of the vote in the plurality tier and the Left party came in second with 30.74 percentage of the vote. While achieving roughly the same vote share as in the electoral district *32 Cloppenburg -- Vechta*, in the latter scenario, the SPD could still be regarded as competitive. To account for these differences in competitiveness between electoral districts, we measure the difference in the vote share of each party to the respective winner of the electoral district. We consider a candidate competitive if the difference between her vote share and that of the winning candidate was less than half as big as the size of the vote share of the leading candidate during any of the two previous parliamentary elections. This measure can be formalized as follows:
+
+$C_{p,d,t} = \begin{cases} 1 \mbox{ if } V_{w,t-1} - V_{p, t-1} \geq \frac{1}{2}{V_{w,t-1}} \\ 0 \mbox{ if } V_{w,t-1} - V_{p, t-1} < \frac{1}{2}{V_{w,t-1}} \end{cases}$,
+
+where $V_{w,t-1}$ is the vote share of the party winning the simple majority in a given electoral district and $V_{p, t-1}$ is the vote share of each party competing in the SMD.
+
+Second, we measure candidate's competitiveness in absolute terms by considering a candidate as uncompetitive if her party achieved less than 20 percentage of the vote in the plurality tier over the past two federal elections. This measure can be formalized as follows:
+
+$C_{p,d,t} = \begin{cases} 1 \mbox{ if } V_{p, t-1} \geq 20 \\ 0 \mbox{ if } V_{p, t-1} < 20 \end{cases}$,
+
+where $V_{p, t-1}$ is the vote share of each party competing in the SMD at the previous elections.
+
+While being conceptually different, the two different measures of competitiveness are empirically strongly correlated to each other with a correlation coefficient of `r round(abs(cor(data2013$uncompetitive_absolute, data2013$uncompetitive, use="complete.obs", method = "pearson")), digits = 2)` for the federal election 2013 and a correlation coefficient of `r round(abs(cor(data2017$uncompetitive_absolute, data2017$uncompetitive, use="complete.obs", method = "pearson")), digits = 2)` for the federal election 2017, see also Table \@ref(tab:tab-A1) (Table A1 in the Appendix).
+
+```{r tab-A1}
+# table comparing the distribution of electoral district specific competitiveness and absolute competitiveness in 2013 and 2017
+
+kable(
+  data %>%
+    select(year, ags, uncompetitive, uncompetitive_absolute) %>%
+    pivot_longer(
+      cols = c("uncompetitive", "uncompetitive_absolute"),
+      names_to = "measure",
+      values_to = "value"
+    ) %>%
+    filter(!is.na(value)) %>%
+    group_by(year, measure, value) %>%
+    summarise(count = n()) %>%
+    mutate(
+      value = case_when(
+        value == 0 ~ "no",
+        value == 1 ~ "yes"
+      ),
+      measure_value = paste0(measure, value)
+    ) %>%
+    arrange(desc(measure_value)) %>%
+    pivot_wider(
+      id_cols = "year",
+      names_from = "measure_value",
+      values_from = "count"
+    ),
+  col.names = c(
+    "Year",
+    "Uncompetitive", "Competitive",
+    "Uncompetitive", "Competitive"
+  ),
+  caption = "Number of municipalities with competitive and uncompetitive candidates",
+) %>%
+  kableExtra::kable_styling(bootstrap_options = c("hover", "striped"))
+
+```
+
+
+### Municipal-level characteristics
+
+#### Parties' electoral strongholds {.unnumbered}
+
+> `electoral_base`
+
+Some parties may enjoy voter support that is highly concentrated in certain municipalities within an electoral district. Thus, there might be some municipalities within an electoral district that represent party-specific electoral strongholds. This characteristic should at the same time increase the probability that a qualified candidate from that municipality runs for office on the platform of the given party. As a matter of fact, most municipalities within the same electoral district are very similar in their partisan preferences. This can be seen in Figure \@ref(fig:fig-A1) (Figure A1 in the Appendix) that shows the empirical distribution of municipal-level differences to the respective electoral district-level average level of support for a given party. Most values are distributed around zero, i.e., the majority of municipalities display levels of partisan support that are very similar to the overall average of the electoral district. We still account for the differences that some municipalities display with respect to the rest of their electoral district. We add a control variable (`electoral_base`) to all models that measures the strength of baseline electoral support for each party. This baseline support for each party reflects the average electoral support it enjoyed in the PR second-tier of the German electoral system across the two elections preceding the respective election under study. We are relying on the vote share of the *PR tier* to measure the average partisan preferences within a given municipality in a more proportional manner that is less biased towards majoritarian tendencies as the plurality tier. Here, we use the two *preceding* elections as to have a clear "pre-treatment" measure of a party's electoral stronghold that is not affected by the central independent variable of interest, i.e., the localness of a candidate.
+
+```{r fig-A1, fig.cap="Similarity of partisan preferences across municipalities within the same electoral district.",  fig.width = 7, fig.height=3}
+
+
+ggplot(data %>%
+  group_by(year, state, electoral_district, party) %>%
+  mutate(dev_electoral_base = mean(electoral_base, na.rm = T) - electoral_base)) +
+  geom_histogram(aes(x = dev_electoral_base),
+    bins = 100
+  ) +
+  facet_wrap(~year) +
+  theme_minimal_hgrid() +
+  theme(
+    text = element_text(
+      family = "Fira Sans",
+      size = 10
+    ),
+    axis.text = element_text(size = 10)
+  ) +
+  scale_x_continuous(limits = c(-50, 50)) +
+  labs(
+    y = "",
+    x = "Municipal-level deviation from electoral district-level average partisan support"
+  )
+```
+
+#### Spatial data and geographical size of the municipality {.unnumbered}
+
+> `vec_neighbors`, `lon`, `lat`
+ 
+We obtain the spatial data (shape files) from the Federal Agency for Cartography and Geodesy (BKG). The data is freely available to the public. We obtain the data reflecting the administrative division of Germany at the end of 2013 and at the end of 2017, which we link to the electoral data of the federal election 2013 and 2017, respectively. We measure the geographical size of a municipality (in square km) by relying on the spatial polygons provided in the shape file.
+
+#### Area and population {.unnumbered}
+
+> `area_km`, `inhabitants`
+
+The data on the number of inhabitants is taken from the shape files provided by the Federal Agency for Cartography and Geodesy (BKG).
+
+#### Degree of urbanization {.unnumbered}
+
+> `urbanisation`, `rural_dummy`
+
+We measure the degree of urbanization of each municipality by considering the cumulative share of space dedicated to settlements and to road infrastructure relative to the overall geographic size of a municipality. The data is published on a yearly basis by the Statistical Offices of the Federation and the Länder. We measure the degree of urbanization in 2013 and 2017, respectively, as reported in the yearly release of the data pertaining to 2013 (reporting date: 31.12.2013) and 2017 (reporting date: 31.12.2017). 
+
+
+## Summary and balance statistics
+
+
+Table \@ref(tab:tab-A2) (Table A2 in the Appendix in the manuscript) and Table \@ref(tab:tab-A3) (Table A3 in the Appendix in the manuscript) provide summary statistics of our data of 2013 and 2017, respectively.
+
+
+```{r tab-A2}
+
+datasummary_skim(
+  data2013 %>%
+    ungroup() %>% 
+    dplyr::select(
+      #`Electoral District` = electoral_district,
+      `Eligibles (1000)` = eligible, 
+      `Distance (km)` = vec_distances, 
+      `Neighbors (0, 1)` = vec_neighbors, 
+      `Localness (0, 1)` = d_residence,
+      `Vote Share` = vote_share,
+      `Party` = party,
+      `Multiple candidates (0,1)` = multicandidate,
+      `Area (km$^2$)` = area_km,
+      `Inhabitants (1000)` = inhabitants,
+      `Urbanization` = urbanisation, 
+      `Uncompetitive` = uncompetitive,
+      `Uncompetitive (absolute measure)` = uncompetitive_absolute,
+      `Partisan Base` = electoral_base, 
+     ), 
+  title = 'Summary statistics (2013).'
+  ) %>%
+  kableExtra::kable_styling(bootstrap_options = c("hover", "striped"))
+
+
+```
+
+```{r tab-A3}
+
+datasummary_skim(
+  data2017 %>%
+    ungroup() %>% 
+     dplyr::select(
+      #`Electoral District` = electoral_district,
+      `Eligibles (1000)` = eligible, 
+      `Distance (km)` = vec_distances, 
+      `Neighbors (0, 1)` = vec_neighbors, 
+      `Localness (0, 1)` = d_residence,
+      `Vote Share` = vote_share,
+      `Party` = party,
+      `Area (km$^2$)` = area_km,
+      `Inhabitants (1000)` = inhabitants,
+      `Urbanization` = urbanisation, 
+      `Uncompetitive` = uncompetitive,
+      `Uncompetitive (absolute measure)` = uncompetitive_absolute,
+      `Partisan Base` = electoral_base, 
+     ), 
+  title = 'Summary statistics (2017).'
+  ) %>%
+  kableExtra::kable_styling(bootstrap_options = c("hover", "striped"))
+
+```
+
+In the following, we provide summary statistics of the covariates in our models while differentiating between municipalities with a local candidate running for office and those without a local candidate running for office (i.e., balance statistics of municipalities by localness of a candidate). Table \@ref(tab:tab-A4) (Table A4 in the manuscript) presents these statistics for 2013, while Table \@ref(tab:tab-A5) (Table A5 in the manuscript) presents these statistics for 2017.
+
+```{r tab-A4}
+
+
+balance_full_2013 = data2013 %>% 
+  dplyr::select(
+    d_residence,
+    eligible, 
+    vec_distances, 
+    vec_neighbors, 
+    multicandidate, 
+    electoral_base, 
+    area_km, 
+    inhabitants, 
+    urbanisation, 
+    uncompetitive, 
+    uncompetitive_absolute) %>% 
+  group_by(d_residence) %>%
+  rename(
+    `Eligibles (1000)` = eligible,
+    `Distance (km)` = vec_distances,
+    `Neighbors (0, 1)` = vec_neighbors,
+    `Multiple candidates (0,1)` = multicandidate,
+    `Area (km$^2$)` = area_km,
+    `Inhabitants (1000)` = inhabitants,
+    `Urbanization` = urbanisation,
+    `Uncompetitive` = uncompetitive,
+    `Uncompetitive (absolute measure)` = uncompetitive_absolute,
+    `Partisan Base` = electoral_base
+  ) %>% 
+  # remove underscore from variables for correct pivot_longer operation which uses names_sep "_" to identify the variables and values
+  rename_with(.cols = everything(), 
+              ~str_remove_all(., "_")
+              ) %>% 
+  summarise(
+    across(everything(), 
+           list(
+             mean = ~mean(.x, na.rm = T), 
+             sd = ~sd(.x, na.rm=T)
+             )
+           )
+    ) %>% 
+  pivot_longer(
+    !dresidence,
+    names_to = c("variable", ".value"),
+    names_sep = "_",
+    values_drop_na = TRUE
+  ) %>% 
+  rename(mean_full = mean, 
+         sd_full = sd)
+
+
+
+balance_geomatch_2013 = data2013 %>% 
+  filter(geomatch==1) %>% 
+  dplyr::select(
+    d_residence,
+    eligible, 
+    vec_distances, 
+    vec_neighbors, 
+    multicandidate, 
+    electoral_base, 
+    area_km, 
+    inhabitants, 
+    urbanisation, 
+    uncompetitive, 
+    uncompetitive_absolute) %>% 
+  group_by(d_residence) %>%
+  rename(
+    `Eligibles (1000)` = eligible,
+    `Distance (km)` = vec_distances,
+    `Neighbors (0, 1)` = vec_neighbors,
+    `Multiple candidates (0,1)` = multicandidate,
+    `Area (km$^2$)` = area_km,
+    `Inhabitants (1000)` = inhabitants,
+    `Urbanization` = urbanisation,
+    `Uncompetitive` = uncompetitive,
+    `Uncompetitive (absolute measure)` = uncompetitive_absolute,
+    `Partisan Base` = electoral_base
+  ) %>% 
+  # remove underscore from variables for correct pivot_longer operation which uses names_sep "_" to identify the variables and values
+  rename_with(.cols = everything(), 
+              ~str_remove_all(., "_")
+              ) %>% 
+  summarise(
+    across(everything(), 
+           list(
+             mean = ~mean(.x, na.rm = T), 
+             sd = ~sd(.x, na.rm=T)
+             )
+           )
+    ) %>% 
+  pivot_longer(
+    !dresidence,
+    names_to = c("variable", ".value"),
+    names_sep = "_",
+    values_drop_na = TRUE
+  ) %>% 
+  rename(mean_geomatch = mean, 
+         sd_geomatch = sd)
+
+
+
+
+balance_2013 = full_join(
+  balance_full_2013, 
+  balance_geomatch_2013, 
+  by = c("dresidence", "variable")
+) %>% 
+  pivot_wider(
+    id_cols = "variable", 
+    values_from = c(mean_full, sd_full, mean_geomatch, sd_geomatch), 
+    names_glue = "{.value}_{dresidence}",
+    names_from = dresidence
+  ) %>% 
+  # create the difference-in-means variable
+  mutate(diffinmeans_full = mean_full_1 - mean_full_0, 
+         diffinmeans_geomatch = mean_geomatch_1 - mean_geomatch_0) %>% 
+  # re-order the variables for the kable
+  select(
+    variable, 
+    mean_full_1, 
+    sd_full_1, 
+    mean_full_0, 
+    sd_full_0, 
+    diffinmeans_full, 
+    mean_geomatch_1, 
+    sd_geomatch_1,
+    mean_geomatch_0, 
+    sd_geomatch_0, 
+    diffinmeans_geomatch
+  )
+
+
+kable(balance_2013,
+  col.names = c(
+    "", "Mean", "SD", "Mean", "SD", "Diff.\nin Means",
+    "Mean", "SD", "Mean", "SD", "Diff.\nin Means"
+  ),
+  digits = 2,
+  booktabs = T,
+  caption = "Balance between municipalities with and without local candidates (2013)"
+) %>%
+  kable_styling(
+    bootstrap_options = c("hover", "striped")
+  ) %>%
+  column_spec(c(6, 11), bold = T) %>%
+  add_header_above(c("",
+    "Local\nCandidate" = 2, "No Local\nCandidate" = 2,
+    "", "Local\nCandidate" = 2, "No Local\nCandidate" = 2,
+    ""
+  )) %>%
+  add_header_above(c(" ", "All municipalities" = 5, "Geo-matched municipalities" = 5))
+
+
+```
+
+```{r tab-A5}
+
+
+balance_full_2017 = data2017 %>% 
+  dplyr::select(
+    d_residence,
+    eligible, 
+    vec_distances, 
+    vec_neighbors, 
+    multicandidate, 
+    electoral_base, 
+    area_km, 
+    inhabitants, 
+    urbanisation, 
+    uncompetitive, 
+    uncompetitive_absolute) %>% 
+  group_by(d_residence) %>%
+  rename(
+    `Eligibles (1000)` = eligible,
+    `Distance (km)` = vec_distances,
+    `Neighbors (0, 1)` = vec_neighbors,
+    `Multiple candidates (0,1)` = multicandidate,
+    `Area (km$^2$)` = area_km,
+    `Inhabitants (1000)` = inhabitants,
+    `Urbanization` = urbanisation,
+    `Uncompetitive` = uncompetitive,
+    `Uncompetitive (absolute measure)` = uncompetitive_absolute,
+    `Partisan Base` = electoral_base
+  ) %>% 
+  # remove underscore from variables for correct pivot_longer operation which uses names_sep "_" to identify the variables and values
+  rename_with(.cols = everything(), 
+              ~str_remove_all(., "_")
+              ) %>% 
+  summarise(
+    across(everything(), 
+           list(
+             mean = ~mean(.x, na.rm = T), 
+             sd = ~sd(.x, na.rm=T)
+             )
+           )
+    ) %>% 
+  pivot_longer(
+    !dresidence,
+    names_to = c("variable", ".value"),
+    names_sep = "_",
+    values_drop_na = TRUE
+  ) %>% 
+  rename(mean_full = mean, 
+         sd_full = sd)
+
+
+
+balance_geomatch_2017 = data2017 %>% 
+  filter(geomatch==1) %>% 
+  dplyr::select(
+    d_residence,
+    eligible, 
+    vec_distances, 
+    vec_neighbors, 
+    multicandidate, 
+    electoral_base, 
+    area_km, 
+    inhabitants, 
+    urbanisation, 
+    uncompetitive, 
+    uncompetitive_absolute) %>% 
+  group_by(d_residence) %>%
+  rename(
+    `Eligibles (1000)` = eligible,
+    `Distance (km)` = vec_distances,
+    `Neighbors (0, 1)` = vec_neighbors,
+    `Multiple candidates (0,1)` = multicandidate,
+    `Area (km$^2$)` = area_km,
+    `Inhabitants (1000)` = inhabitants,
+    `Urbanization` = urbanisation,
+    `Uncompetitive` = uncompetitive,
+    `Uncompetitive (absolute measure)` = uncompetitive_absolute,
+    `Partisan Base` = electoral_base
+  ) %>% 
+  # remove underscore from variables for correct pivot_longer operation which uses names_sep "_" to identify the variables and values
+  rename_with(.cols = everything(), 
+              ~str_remove_all(., "_")
+              ) %>% 
+  summarise(
+    across(everything(), 
+           list(
+             mean = ~mean(.x, na.rm = T), 
+             sd = ~sd(.x, na.rm=T)
+             )
+           )
+    ) %>% 
+  pivot_longer(
+    !dresidence,
+    names_to = c("variable", ".value"),
+    names_sep = "_",
+    values_drop_na = TRUE
+  ) %>% 
+  rename(mean_geomatch = mean, 
+         sd_geomatch = sd)
+
+
+
+
+balance_2017 = full_join(
+  balance_full_2017, 
+  balance_geomatch_2017, 
+  by = c("dresidence", "variable")
+) %>% 
+  pivot_wider(
+    id_cols = "variable", 
+    values_from = c(mean_full, sd_full, mean_geomatch, sd_geomatch), 
+    names_glue = "{.value}_{dresidence}",
+    names_from = dresidence
+  ) %>% 
+  # create the difference-in-means variable
+  mutate(diffinmeans_full = mean_full_1 - mean_full_0, 
+         diffinmeans_geomatch = mean_geomatch_1 - mean_geomatch_0) %>% 
+  # re-order the variables for the kable
+  select(
+    variable, 
+    mean_full_1, 
+    sd_full_1, 
+    mean_full_0, 
+    sd_full_0, 
+    diffinmeans_full, 
+    mean_geomatch_1, 
+    sd_geomatch_1,
+    mean_geomatch_0, 
+    sd_geomatch_0, 
+    diffinmeans_geomatch
+  )
+
+
+kable(balance_2017,
+col.names = c(
+  "", "Mean", "SD", "Mean", "SD", "Diff.\nin Means",
+  "Mean", "SD", "Mean", "SD", "Diff.\nin Means"
+),
+digits = 2, 
+caption = "Balance between municipalities with and without local candidates (2017)"
+) %>%
+  kable_styling(
+    bootstrap_options = c("hover", "striped")
+  ) %>%
+  column_spec(c(6, 11), bold = T) %>%
+  add_header_above(c("",
+    "Local\nCandidate" = 2, "No Local\nCandidate" = 2,
+    "", "Local\nCandidate" = 2, "No Local\nCandidate" = 2,
+    ""
+  )) %>%
+  add_header_above(c(" ", "All municipalities" = 5, "Geomatched Data" = 5)
+                   )
+
+
+```
+
+#### Distribution of distance between municipalities (Geo-matched municipalities) {.unnumbered}
+
+Figure \@ref(fig:fig-A2) (Figure A2 in the Appendix) shows the distribution of the spatial proximity between the centroids of the home municipalities of candidates and the centroids of the adjacent municipalities that we identify with the help of our geo-matching strategy. The dashed line shows the median distance.
+
+```{r fig-A2, fig.cap="Distribution of the spatial proximity between the centroids of the municipalities in the geo-matched data (median proximity shown as dashed line).", fig.height=3}
+
+
+ggplot(data = data %>% 
+  filter(geomatch==1) %>% 
+  group_by(year, electoral_district, party) %>% 
+  mutate(distanceneighbors = 
+           case_when(d_residence == 0 & geomatch==1 ~ vec_distances, 
+                     TRUE ~ NA_real_),
+         avg_distanceneighbors = mean(distanceneighbors,
+                                       na.rm=T)) %>% 
+    ungroup() %>% 
+    group_by(year) %>% 
+    mutate(median_distanceneighbors = median(distanceneighbors, 
+                                             na.rm=T)
+           )
+       ) + 
+  geom_histogram(aes(x = avg_distanceneighbors), 
+                 fill = "lightgray") +   
+  geom_vline(aes(xintercept = median_distanceneighbors), 
+             size = 1, 
+             linetype = "longdash",
+             color = "#C65858") + 
+  facet_wrap(~year) + 
+  labs(x = "Avg. spatial proximity betw. centroids of candidates' home municipalities & neighboring municipalities", 
+       y = "") + 
+  theme_minimal_hgrid() +
+  theme(
+    legend.position = "none",
+    text = element_text(
+      family = "Fira Sans",
+      size = 9
+    ),
+    axis.text = element_text(size = 9), 
+  )
+
+
+```
+
+
+
+# Analysis & results
+
+In the following, we provide the code for all analyses that we present in the manuscript and in the Appendix. We rely on the following naming convention for the models that we estimate with prefixes M1-M6 indicating on which dataset the specific additional analyses are estimated. 
+
+- M1: 2013, all municipalities
+- M2: 2017, all municipalities
+- M3: 2013, geo-matched neighbouring municipalities
+- M4: 2017, geo-matched neighbouring municipalities
+- M5: 2013, all neighbouring municipalities
+- M6: 2017, all neighbouring municipalities 
+
+
+## Baseline estimates 
+
+As can be seen from Table \@ref(tab:tab-1) (Table 1 in the manuscript), with the exception of the candidate of the German populist radical right party AfD, in the electoral district *213* illustrated earlier, the electoral support for all candidates (2017) is substantively higher in the municipality in which they live than in the remaining municipalities of the electoral district.
+
+```{r tab-1}
+
+kable(map_data_mun_dist_213 %>%
+  as_tibble() %>%
+  group_by(party, d_residence) %>%
+  summarise(meanshare = mean(vote_share)) %>%
+  pivot_wider(
+    id_cols = "party",
+    names_from = "d_residence",
+    values_from = "meanshare"
+  ) %>%
+  mutate(party = case_when(
+    party == "afd" ~ "AfD",
+    party == "cdu_csu" ~ "CDU/CSU",
+    party == "dielinke" ~ "Die Linke",
+    party == "fdp" ~ "FDP",
+    party == "greens" ~ "Greens",
+    party == "spd" ~ "SPD"
+  )) %>%
+  # re-arrange the columns for the tabular presentation
+  select("party", "1", "0"),
+col.names = c("Party", "Local Vote Share", "Average Non-Local Vote Share"),
+digits = 2,
+booktabs = T,
+caption = "Vote shares of candidates in their home municipalities (local) and their average vote shares in the remaining municipalities (non-local) of an electoral district. For illustrative purposes, the table reports the vote shares in electoral district *213 - Ebersberg Erding* in the federal election of 2017."
+) %>%
+  kableExtra::kable_styling(bootstrap_options = c("hover", "striped"))
+
+
+```
+
+
+```{r estimation-tab-2}
+
+# Effect of localness on vote share
+# M1 (2013) and M2 (2017) present results for the full dataset, M3 (2013) and M4 (2017) present results for the geo-matched subset of the data. 
+
+# M1 - 2013 all municipalities ####
+M1 <- lm(vote_share ~ d_residence + multicandidate +
+          electoral_base + urbanisation + area_km + inhabitants +
+          as.factor(electoral_district) + as.factor(party),
+        data = data2013,
+        )
+
+# tidy
+M1_tidy <- broom::tidy(M1)
+
+
+
+# M2 - 2017 all municipalities ####
+M2 <- lm(vote_share ~ d_residence + multicandidate +
+           electoral_base + urbanisation + area_km + inhabitants +
+           as.factor(electoral_district) + as.factor(party),
+         data = data2017
+         )
+
+# tidy
+M2_tidy <- broom::tidy(M2)
+
+
+# M3 - 2013 geo-matched neighbouring municipalities  ####
+M3 <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2013 %>%
+  filter(geomatch == 1),
+weights = geomatch_weights
+)
+
+# tidy
+M3_tidy <- broom::tidy(M3)
+
+
+# M4 - 2017 geo-matched neighbouring municipalities ####
+M4 <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2017 %>%
+  filter(geomatch == 1),
+weights = geomatch_weights
+)
+
+# tidy
+M4_tidy <- broom::tidy(M4)
+```
+
+Next, we systematically analyze the relationship between a candidate's localness and her performance across her electoral district in a series of linear regressions (see Table \@ref(tab:tab-2), columns 1 and 2 (Table 2 in the manuscript)). We also focus on the subset of municipalities that are geographically closest to a candidate's home municipality while being most similar in socio-demographic terms, see \@ref(tab:tab-2), columns 3 and 4). These are the municipalities that we have identified earlier by means of the geo-matching strategy. Columns 3 and 4 of Table \@ref(tab:tab-2) show that the results persist under this geo-matching design. Being a local fellow citizen helps SMD candidates, on average, to gain `r round(M3_tidy %>% filter(term=="d_residence") %>% pull(estimate), digits = 2)` and `r round(M4_tidy %>% filter(term=="d_residence") %>% pull(estimate), digits = 2)` percentage points, respectively, in 2013 and 2017 (see column 3 and column 4 of Table \@ref(tab:tab-2)). 
+
+
+```{r tab-2}
+
+models_baseline = list(
+  M1, M2, 
+  M3, M4)
+
+names(models_baseline) = c("2013 ", "2017 ", "2013", "2017")
+
+f <- function(x) format(round(x, 2))
+gm <- list(
+  list("raw" = "r.squared", "clean" = "R$^2$", "fmt" = f),
+  list("raw" = "nobs", "clean" = "Num.Obs.", "fmt" = f)
+  )
+
+cm <- c(
+  "d_residence" = "Local (0, 1)",
+  "multicandidate" = "Multiple candidates (0,1)",
+  "area_km" = "Area (km$^2$)",
+  "inhabitants" = "Inhabitants (1000)",
+  "urbanisation" = "Urbanization",
+  "(Intercept)" = "Intercept"
+)
+
+vcovlist = map(models_baseline, 
+               ~sandwich::vcovHC(.,
+                                 type= "HC1", 
+                                 cluster="electoral_district")
+               )
+
+rows <- tribble(
+  ~term, ~"2013", ~"2017", ~"2013", ~"2017",
+  "Electoral-District-Fixed Effects",
+  "$\\checkmark$", "$\\checkmark$", "$\\checkmark$", "$\\checkmark$", 
+  "Party-Fixed Effects",
+  "$\\checkmark$", "$\\checkmark$", "$\\checkmark$", "$\\checkmark$", 
+)
+
+attr(rows, "position") <- c(13, 14)
+
+
+modelsummary(models_baseline, 
+             coef_map = cm,
+             gof_map = gm,
+             add_rows = rows, 
+             statistic_override = vcovlist, 
+             stars = TRUE,
+             title = "Effect of candidates' localness on their vote share.",
+             escape=FALSE,
+             output = "kableExtra"
+  ) %>%
+  # column labels
+  add_header_above(c(" " = 1, 
+                     "All municipalities" = 2, 
+                     "Geo-matched municipalities" = 2)
+                   ) %>%
+  # footnote
+  add_footnote("All models report robust standard errors clustered at the electoral-district level.",
+    notation = "none"
+  )
+
+
+```
+
+
+
+Table \@ref(tab:tab-A8) (Table A8 in the Appendix) further shows that the effect holds both for the subset of municipalities with, on average, smaller and larger than median levels of distance between the polygon centroids of home and neighboring municipalities.
+
+
+```{r calculate-median-of-average-distance-among-geomatched-triples}
+
+# What is the median of the distance among the geo-matched neighbouring municipalities? To calculate the distance between the geo-matched treated and control municipalities, we take the mean of the distance among the municipality triples (one treated, two control).
+
+data2013 = data2013 %>%
+     group_by(electoral_district, party) %>% 
+     mutate(
+       distanceneighbors = 
+         case_when(d_residence == 0 & geomatch==1 ~ vec_distances, 
+                   TRUE ~ NA_real_), 
+       mean_distanceneighbors = mean(distanceneighbors,
+                                     na.rm=T)
+       ) %>% 
+    ungroup() %>% 
+    mutate(mediandistance = median(distanceneighbors, na.rm = T)) 
+
+
+data2017 = data2017 %>%
+     group_by(electoral_district, party) %>% 
+     mutate(
+       distanceneighbors = 
+         case_when(d_residence == 0 & geomatch==1 ~ vec_distances, 
+                   TRUE ~ NA_real_), 
+       mean_distanceneighbors = mean(distanceneighbors,
+                                     na.rm=T)
+       ) %>% 
+    ungroup() %>% 
+    mutate(mediandistance = median(distanceneighbors, na.rm = T)) 
+
+
+```
+
+
+```{r estimate-tab-A8-near-and-far-subsets, include = TRUE}
+
+# M3_near - 2013 geo-matched neighbouring municipalities (subset: located near to each other) ####
+M3_near = lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party), 
+  # filter data to include only those geomatched municipality sets 
+  # that are, on average, *less* than the median far away from centroid of home municipality 
+   data = data2013 %>% 
+    filter(geomatch == 1 & mean_distanceneighbors < mediandistance), 
+  weights = geomatch_weights)
+
+
+# M3_far - 2013 geo-matched neighbouring municipalities (subset: located far from each other) ####
+M3_far = lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party), 
+  # filter data to include only those geomatched municipality sets 
+  # that are, on average, *further* than the median far away from centroid of home municipality 
+   data = data2013 %>% 
+    filter(geomatch == 1 & mean_distanceneighbors > mediandistance), 
+  weights = geomatch_weights)
+
+
+# M4_near - 2017 geo-matched neighbouring municipalities (subset: located near to each other) ####
+M4_near = lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party), 
+  # filter data to include only those geomatched municipality sets 
+  # that are, on average, *less* than the median far away from centroid of home municipality 
+   data = data2017 %>% 
+    filter(geomatch == 1 & mean_distanceneighbors < mediandistance), 
+  weights = geomatch_weights)
+
+
+# M4_far - 2017 geo-matched neighbouring municipalities (subset: located far from each other) ####
+M4_far = lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party), 
+  # filter data to include only those geomatched municipality sets 
+  # that are, on average, *further* than the median far away from centroid of home municipality 
+   data = data2017 %>% 
+    filter(geomatch == 1 & mean_distanceneighbors > mediandistance), 
+  weights = geomatch_weights)
+
+
+```
+
+```{r tab-A8, include = TRUE}
+
+nearfarmodels = list(
+  M3_near, M4_near, 
+  M3_far, M4_far)
+
+names(nearfarmodels) = c("2013 ", "2013", "2017 ", "2017")
+
+
+vcovlist = map(nearfarmodels, 
+               ~sandwich::vcovHC(.,
+                                 type= "HC1", 
+                                 cluster="electoral_district")
+               )
+
+
+modelsummary(nearfarmodels, 
+             coef_map = cm,
+             gof_map = gm,
+             add_rows = rows, 
+             statistic_override = vcovlist, 
+             stars = TRUE,
+             title = "Effect of candidates' localness on their vote share (geo-matched municipalities by average distances between centroids of municipalities).",
+             escape=FALSE,
+             output = "kableExtra"
+  ) %>%
+  # column labels
+  add_header_above(c(" " = 1, 
+                     "Smaller Distance\n(Subset 1)" = 2, 
+                     "Larger Distance\n(Subset 2)" = 2)
+                   ) %>%
+  # footnote
+  add_footnote("All models report robust standard errors clustered at the electoral-district level.",
+    notation = "none"
+  )
+
+
+```
+
+
+
+## Uncompetitive candidates 
+
+We next move to assess whether voters exhibit a bias towards candidates from their local community independently from any strategic-instrumental reasons. Such reasons could motivate them to vote for a SMD from their home municipality (*H2*). To do so, we focus only on those political candidates that have no prospect of winning the SMD in which they are running for office (`uncompetitive == 1`). Our findings are reported in Table \@ref(tab:tab-3) (Table 3 in the manuscript) and give support to *H2* in demonstrating that even among non-competitive candidates, localness has a positive effect on a candidate's vote share.
+
+```{r estimation-tab-3, include=FALSE}
+
+# Effect of localness on vote share among non-competitive candidates 
+
+# M1_uncompetitive - 2013 all municipalities ####
+M1_uncompetitive <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2013 %>%
+  filter(uncompetitive == 1)
+)
+
+# tidy
+M1_uncompetitive_tidy <- broom::tidy(M1_uncompetitive)
+
+
+# M2_uncompetitive - 2017 all municipalities ####
+M2_uncompetitive <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2017 %>%
+  filter(uncompetitive == 1)
+)
+
+# tidy
+M2_uncompetitive_tidy <- broom::tidy(M2_uncompetitive)
+
+
+# M3_uncompetitive - 2013 geo-matched neighbouring municipalities ####
+M3_uncompetitive <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2013 %>%
+  filter(uncompetitive == 1 & geomatch == 1),
+weights = geomatch_weights
+)
+
+# tidy
+M3_uncompetitive_tidy <- broom::tidy(M3_uncompetitive)
+
+
+# M4_uncompetitive - 2017 geo-matched neighbouring municipalities ####
+M4_uncompetitive <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2017 %>%
+  filter(uncompetitive == 1 & geomatch == 1),
+weights = geomatch_weights
+)
+
+# tidy
+M4_uncompetitive_tidy <- broom::tidy(M4_uncompetitive)
+```
+
+
+```{r tab-3}
+
+models_uncompetitive = list(
+  M1_uncompetitive, M2_uncompetitive, 
+  M3_uncompetitive, M4_uncompetitive)
+
+names(models_uncompetitive) = c("2013 ", "2017 ", "2013", "2017")
+
+
+vcovlist = map(models_uncompetitive, 
+               ~sandwich::vcovHC(.,
+                                 type= "HC1", 
+                                 cluster="electoral_district")
+               )
+
+
+
+modelsummary(models_uncompetitive, 
+             coef_map = cm,
+             gof_map = gm,
+             add_rows = rows, 
+             statistic_override = vcovlist, 
+             stars = TRUE,
+             title = "Effect of candidates' localness on their vote share among non-competitive candidates.",
+             escape=FALSE,
+             output = "kableExtra"
+  ) %>%
+  # column labels
+  add_header_above(c(" " = 1, 
+                     "All municipalities" = 2, 
+                     "Geo-matched municipalities" = 2)
+                   ) %>%
+  # footnote
+  add_footnote("All models report robust standard errors clustered at the electoral-district level.",
+    notation = "none"
+  )
+
+
+
+```
+
+These results are also robust to use an absolute measure of candidate competitiveness. This measure classifies all such candidates as non-competitive whose party did not achieve more than 20 percent of the popular vote in the respective electoral district in question over the past two parliamentary elections (see columns 3 and 4 of Table \@ref(tab:tab-A7) below (Table A7 in the Appendix)).
+
+
+
+## Uncompetitive candidates II
+
+In columns 3 and 4 in Table \@ref(tab:tab-A7), we also estimate the effect with an alternative operationalization of candidates' non-competitiveness. The results remain largely the same.
+
+```{r estimation-tab-A7-uncompetitive-absolute-subset, include=FALSE}
+
+# M1_uncompetitive_absolute - 2013 all municipalities (uncompetitive candidates, absolute operationalisation) ####
+M1_uncompetitive_absolute <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2013 %>%
+  filter(uncompetitive_absolute == 1)
+)
+
+
+
+# M2_uncompetitive_absolute - 2017 all municipalities (uncompetitive candidates, absolute operationalisation) ####
+M2_uncompetitive_absolute <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2017 %>%
+  filter(uncompetitive_absolute == 1)
+)
+
+
+
+```
+
+
+## Uncompetitive candidates III
+
+We also analyze whether there are differential benefits of a local electoral advantage for i.) candidates who are uncompetitive, but not entirely hopeless--as evidenced by the fact that their candidacy is revealed on the ballot paper along with the other first four candidates of a party's list (in addition to their candidacy in the plurality tier)--and ii.) those candidates who are uncompetitive, but for whom the former is not the case. 
+
+```{r estimation-tab-A9-prhopeful-candidates}
+
+# Variation among uncompetitive SMD candidates depending on their list position in the PR tier ####
+
+# M1_uncompetitive_prhopeful - 2013 all municipalities (uncompetitive candidates with hopeful PR list position) ####
+M1_uncompetitive_prhopeful <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2013 %>%
+  filter(uncompetitive == 1 & onballot_pr == 1)
+)
+
+
+# M2_uncompetitive_prhopeful - 2017 all municipalities (uncompetitive candidates with hopeful PR list position) ####
+M2_uncompetitive_prhopeful <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2017 %>%
+  filter(uncompetitive == 1 & onballot_pr == 1)
+)
+
+
+# M1_uncompetitive_prhopeless - 2013 all municipalities (uncompetitive candidates without hopeful PR list position) ####
+M1_uncompetitive_prhopeless <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2013 %>%
+  filter(uncompetitive == 1 & onballot_pr == 0)
+)
+
+# M2_uncompetitive_prhopeless - 2017 all municipalities (uncompetitive candidates without hopeful PR list position) ####
+M2_uncompetitive_prhopeless <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2017 %>%
+  filter(uncompetitive == 1 & onballot_pr == 0)
+)
+
+```
+
+The results are shown in Table \@ref(tab:tab-A9) (Table A9 in the Appendix), showing that the effect appears, indeed, somewhat stronger for the "PR-tier-hopeful" candidates. This is consistent with a potential stronger priming effect of a candidate's localness as her name is printed twice on the ballot paper. More importantly, however, the results also show that candidates' localness still makes a significant and substantive difference among those candidates who are not only uncompetitive, but also "hopeless" in the PR tier (see columns 3 and 4 in Table \@ref(tab:tab-A9)).
+
+
+```{r tab-A9, include = TRUE}
+
+models_prhopeful = list(
+  M1_uncompetitive_prhopeful, M2_uncompetitive_prhopeful,
+  M1_uncompetitive_prhopeless, M2_uncompetitive_prhopeless)
+
+names(models_prhopeful) = c("2013 ", "2017 ", "2013", "2017")
+
+
+vcovlist = map(models_prhopeful, 
+               ~sandwich::vcovHC(.,
+                                 type= "HC1", 
+                                 cluster="electoral_district")
+               )
+
+
+modelsummary(models_prhopeful, 
+             coef_map = cm,
+             gof_map = gm,
+             statistic_override = vcovlist, 
+             add_rows = rows,
+             stars = TRUE,
+             title = "Effect of candidates' localness on their vote share (PR-hopeful and PR-hopeless candidates).",
+             escape=FALSE,
+             output = "kableExtra"
+  ) %>%
+  # column labels
+  add_header_above(c(" " = 1, 
+                     "Uncompetitive Candidates\n(Hopeful in the PR tier)" = 2, 
+                     "Uncompetitive Candidates\n(Hopeless in the PR tier)" = 2)
+                   ) %>%
+  # footnote
+  add_footnote("All models report robust standard errors clustered at the electoral-district level.",
+    notation = "none"
+  )
+                     
+
+```
+
+## All neighbors (no geo-matching)
+
+In Table \@ref(tab:tab-A6) (Table A6 in the Appendix), we also estimate the effect of a candidate's localness on her vote share among the full set of municipalities that are adjacent (neighboring) to the home municipality of a candidate (i.e., all municipalities coloured in green in Figure \@ref(fig:fig-2)). We estimate the effect both for the set of all candidates and uncompetitive candidates. The overall findings largely remain the same even without using a geo-matching approach.
+
+
+```{r estimation-tab-A6}
+
+# M5_allneighbors - 2013 all neigbouring municipalities ####
+M5_allneighbors <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2013 %>%
+  filter(vec_neighbors == 1 | d_residence == 1)
+)
+
+# M6_allneighbors - 2017 all neigbouring municipalities ####
+M6_allneighbors <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2017 %>%
+  filter(vec_neighbors == 1 | d_residence == 1)
+)
+
+# M5_uncompetitive_allneighbors - 2013 all neigbouring municipalities (uncompetitive candidates) ####
+M5_uncompetitive_allneighbors <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2013 %>%
+  filter(uncompetitive == 1) %>%
+  filter(vec_neighbors == 1 | d_residence == 1)
+)
+
+# M6_uncompetitive_allneighbors - 2017 all neigbouring municipalities (uncompetitive candidates) ####
+M6_uncompetitive_allneighbors <- lm(vote_share ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2017 %>%
+  filter(uncompetitive == 1) %>%
+  filter(vec_neighbors == 1 | d_residence == 1)
+)
+
+```
+
+
+```{r tab-A6}
+
+
+models_allneighbors = list(
+  M5_allneighbors, M6_allneighbors, 
+  M5_uncompetitive_allneighbors, M6_uncompetitive_allneighbors)
+
+names(models_allneighbors) = c("2013 ", "2017 ", "2013", "2017")
+
+
+vcovlist = map(models_allneighbors, 
+               ~sandwich::vcovHC(.,
+                                 type= "HC1", 
+                                 cluster="electoral_district")
+               )
+
+
+
+modelsummary(models_allneighbors, 
+             coef_map = cm,
+             gof_map = gm,
+             add_rows = rows, 
+             statistic_override = vcovlist, 
+             stars = TRUE,
+             title = "Effect of candidates' localness on their vote share (candidates' home municipalities and all neighboring municipalities).",
+             escape=FALSE,
+             output = "kableExtra"
+  ) %>%
+  # column labels
+  add_header_above(c(" " = 1, 
+                     "All candidates" = 2, 
+                     "Uncompetitive candidates" = 2)
+                   ) %>%
+  # column labels
+  add_header_above(c(" " = 1, 
+                     "All neighboring municipalities" = 4)
+                   ) %>%
+  # footnote
+  add_footnote("All models report robust standard errors clustered at the electoral-district level.",
+    notation = "none"
+  )
+
+
+
+```
+
+
+
+
+## Fractional Response Model 
+
+```{r estimation-fig-A3-fitted-values}
+
+M_fitted <- dplyr::bind_rows(
+  broom::augment(M1) %>%
+    select(.fitted) %>%
+    mutate(model = "All municipalities 2013"),
+  broom::augment(M2) %>%
+    select(.fitted) %>%
+    mutate(model = "All municipalities 2017"),
+  broom::augment(M3) %>%
+    select(.fitted) %>%
+    mutate(model = "Geo-matched municipalities 2013"),
+  broom::augment(M4) %>%
+    select(.fitted) %>%
+    mutate(model = "Geo-matched municipalities 2017"),
+  broom::augment(M1_uncompetitive) %>%
+    select(.fitted) %>%
+    mutate(model = "All municipalities 2013\n(uncompetitive candidates)"),
+  broom::augment(M2_uncompetitive) %>%
+    select(.fitted) %>%
+    mutate(model = "All municipalities 2017\n(uncompetitive candidates)"),
+  broom::augment(M3_uncompetitive) %>%
+    select(.fitted) %>%
+    mutate(model = "Geo-matched municipalities 2013\n(uncompetitive candidates)"),
+  broom::augment(M4_uncompetitive) %>%
+    select(.fitted) %>%
+    mutate(model = "Geo-matched municipalities 2017\n(uncompetitive candidates)")
+)
+
+# max(M_fitted$.fitted)
+# round(nrow(M_fitted %>% filter(.fitted < 0)) / nrow(M_fitted)*100, digits = 2)
+
+```
+
+Figure \@ref(fig:fig-A3) (Figure A3 in the Appendix) shows that the large majority of our predicted values (`r round(nrow(M_fitted %>% filter(.fitted > 0)) / nrow(M_fitted)*100, digits = 2)` percent of all observations) fall within the range between 0 and 100.
+
+```{r fig-A3, fig.cap = "Distribution of predicted values (models presented in Table 1 and Table 2 in the manuscript).", fig.height=3}
+
+ggplot(
+  data = M_fitted,
+  aes(
+    x = .fitted,
+    fill = model
+  )
+) +
+  geom_histogram() +
+  geom_vline(xintercept = 0) +
+  scale_fill_brewer("Model") +
+  labs(
+    x = "Fitted values",
+    y = ""
+  ) +
+  theme_minimal_hgrid() +
+  theme(
+    text = element_text(
+      family = "Fira Sans",
+      size = 10
+    ),
+    axis.text = element_text(size = 10)
+  )
+```
+
+
+As visualized in Figure \@ref(fig:fig-A3) a small share of the predicted values in our models fall below 0. As an alternative to using linear models we also estimate fractional response models (FRMs) as proposed by @Papke.1996. The FRM presents an extension to the generalized linear model for continuous variables measured as proportions, i.e., that are bounded between zero and one, and relies on quasi-maximum likelihood estimation. We estimate a logit formulation of the FRM model using electoral district and party fixed effects and report robust standard errors clustered at the electoral district level. While a candidate's vote share is measured in percentage points [0,100] in the main body of the text, for the estimation of the FRM, we transform the dependent variable to [0,1]. The results are shown in columns 1 and 2 of Table \@ref(tab:tab-A7), confirming the robustness of our findings to this alternative modeling strategy.
+
+
+```{r estimation-tab-A7-fractional-response-model}
+
+# M1_frm - 2013 all municipalities (Fractional Response Model) ####
+M1_frm <- glm(vote_share / 100 ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2013,
+family = quasibinomial("logit")
+)
+
+
+# M2_frm - 2017 all municipalities (Fractional Response Model) ####
+M2_frm <- glm(vote_share / 100 ~ d_residence + multicandidate +
+  electoral_base + urbanisation + area_km + inhabitants +
+  as.factor(electoral_district) + as.factor(party),
+data = data2017,
+family = quasibinomial("logit")
+)
+
+
+```
+
+
+## Rural areas
+
+There is evidence that local effects may be stronger in rural areas [e.g. @Gorecki.2012]. For this reason, we also conduct additional analyses in which we restrict our analyses to rural areas. We identify rural municipalities through a measure of urbanization, namely the cumulative share of space dedicated to settlements and to road infrastructure. We classify municipalities as rural if less than 15 percent of their total area consist of settlements or road infrastructure.
+
+The original data contains `r nrow(data %>% filter(d_residence==0))` control and `r nrow(data %>% filter(d_residence==1))` treated municipalities (with local candidates) across the two years in our dataset. The subset of rural municipalities contains `r nrow(data %>% filter(rural_dummy==1 & d_residence==0))` control and `r nrow(data %>% filter(rural_dummy==1 & d_residence==1))` treated municipalities. We re-estimate model M1 and model M2 (see Table \@ref(tab:tab-2)) on this subset of rural municipalities. Table \@ref(tab:tab-A7) (column 5 and column 6) presents the results, showing that the local effect further increases in size in rural communities, confirming the findings of @Gorecki.2012.
+
+```{r estimation-tab-A7-rural-municipalities}
+
+# M1_rural - 2013 all municipalities (rural subset) ####
+M1_rural <- lm(vote_share ~ d_residence + multicandidate +
+                 electoral_base + urbanisation + area_km + inhabitants +
+                 as.factor(electoral_district) + as.factor(party),
+               data = data %>% 
+                 filter(rural_dummy == 1 & year == 2013),
+               )
+
+
+# M2_rural - 2017 all municipalities (rural subset) ####
+M2_rural <- lm(vote_share ~ d_residence + multicandidate +
+                  electoral_base + urbanisation + area_km + inhabitants +
+                  as.factor(electoral_district) + as.factor(party),
+                data = data %>% 
+                 filter(rural_dummy == 1 & year == 2017)
+              )
+
+```
+
+
+```{r tab-A7}
+
+additionalmodels = list(
+  M1_frm, M2_frm, 
+  M1_uncompetitive_absolute, M2_uncompetitive_absolute,
+  M1_rural, M2_rural)
+names(additionalmodels) = c("2013 ", "2017 ", " 2013", " 2017", "2013", "2017")
+
+
+vcovlist = map(additionalmodels, 
+               ~sandwich::vcovHC(.,
+                                 type= "HC1", 
+                                 cluster="electoral_district")
+               )
+rowswide <- tribble(
+    ~term, ~"2013", ~"2017", ~"2013", ~"2017", ~"2013", ~"2017",
+    "Electoral District Fixed Effects",
+    "$\\checkmark$", "$\\checkmark$", "$\\checkmark$", "$\\checkmark$", "$\\checkmark$", "$\\checkmark$", 
+    "Party Fixed Effects",
+    "$\\checkmark$", "$\\checkmark$", "$\\checkmark$", "$\\checkmark$", "$\\checkmark$", "$\\checkmark$", 
+  )
+
+attr(rowswide, "position") <- c(13, 14)
+
+modelsummary(additionalmodels, 
+             coef_map = cm,
+             gof_map = gm,
+             add_rows = rowswide,
+             statistic_override = vcovlist, 
+             stars = TRUE,
+             title = "Effect of candidates' localness on their vote share (robustness analyses).",
+             escape=FALSE,
+             output = "kableExtra"
+  ) %>%
+  # column labels
+  add_header_above(c(" " = 1, 
+                     "Fractional Response Model" = 2, 
+                     "Uncompetitive Candidates\n(Absolute Measure)" = 2,
+                     "'Rural' Municipalities" = 2)
+                   ) %>%
+  # footnote
+  add_footnote("All models report robust standard errors clustered at the electoral district level.",
+    notation = "none"
+  )
+
+
+```
+
+
+
